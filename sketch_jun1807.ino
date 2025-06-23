@@ -376,7 +376,7 @@ uint16_t fetchLastIdFromServer() {
   } else {
     displayMessage("Server Error", "Code: " + String(httpCode), 2000);
     http.end();
-    return 0;
+    return -1; // Return -1 to indicate failure
   }
 }
 
@@ -453,8 +453,7 @@ void scanForFingerprint() {
     }
     showMainMenu();
   } else {
-    // Small delay to prevent rapid failed reads if a finger is held down
-    delay(500); 
+    displayMessage("Finger not Found", "Try again: " + String(fingerID), 500);
   }
 }
 
@@ -466,10 +465,15 @@ void enrollNewFingerprint() {
   displayMessage("Enrollment:", "Fetching ID...");
   uint16_t newId = fetchLastIdFromServer() + 1;
 
-  if (newId == 1 && WiFi.status() != WL_CONNECTED) { // fetchLastId returns 0 on failure, so newId becomes 1
-      displayMessage("Enroll Failed", "Check WiFi/Server", 2000);
+  if (WiFi.status() != WL_CONNECTED) {
+      displayMessage("Enroll Failed", "Check WiFi", 2000);
       showMainMenu();
       return;
+  }
+  if (newId == 0) { // fetchLastId returns -1 on failure, so newId becomes 0
+    displayMessage("Enroll Failed", "Check Server", 2000);
+    showMainMenu();
+    return;
   }
   
   displayMessage("Place finger", "ID: " + String(newId));
