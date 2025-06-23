@@ -1,6 +1,6 @@
 /**************************************************************************************************
  * Improved Fingerprint Attendance System for ESP32
- * Version: 5.3 (Fully Commented)
+ * Version: 1.0
  *
  * Description:
  * A comprehensive fingerprint attendance system using an ESP32. It is designed to be
