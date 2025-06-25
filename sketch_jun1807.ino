@@ -1,19 +1,19 @@
 /**************************************************************************************************
  * Improved Fingerprint Attendance System for ESP32
- * Version: 1.0
+ * Version: 1.2 (Lecture Schedule Integration)
  *
  * Description:
  * A comprehensive fingerprint attendance system using an ESP32. It is designed to be
- * robust and user-friendly, with features for online and offline operation.
+ * robust and user-friendly, with features for online and offline operation. This version
+ * fetches a weekly lecture schedule and logs attendance against specific lecture IDs.
  *
  * Key Features:
- * - On-Demand WiFi Setup: Uses WiFiManager to create a web portal for WiFi configuration
- * only when a dedicated button is held down, allowing for fast boot-up in normal operation.
- * - Offline Logging: If no WiFi is available, attendance logs are saved to an SD card.
+ * - Lecture-Based Attendance: Fetches a weekly schedule and sends attendance with a lecture ID.
+ * - On-Demand WiFi Setup: Uses WiFiManager for easy WiFi configuration.
+ * - Offline Logging: If no WiFi is available, attendance logs (with lecture ID) are saved to an SD card.
  * - Automatic Sync: Saved offline logs are automatically sent to the server once an
  * internet connection is established.
- * - Accurate Timestamps: Uses a DS3231 Real-Time Clock (RTC) with a backup battery
- * to ensure timestamps are always accurate, even after power loss.
+ * - Accurate Timestamps: Uses a DS3231 RTC to determine the correct lecture slot.
  * - Secure Server Communication: Uses HTTPS for secure data transmission.
  * - User-Friendly Interface: A 16x2 LCD provides clear instructions and feedback.
  * - Low-Power Mode: Enters light sleep when idle to conserve battery, waking on button press.
@@ -32,303 +32,310 @@
 #include <SPI.h>
 
 // --- HARDWARE PIN DEFINITIONS ---
-// LCD Pins (rs, en, d4, d5, d6, d7)
 const uint8_t rs = 27, en = 26, d4 = 25, d5 = 33, d6 = 32, d7 = 14;
-// Fingerprint Sensor RX/TX (connected to ESP32's Serial Port 2)
-const uint8_t FINGERPRINT_RX = 16;
-const uint8_t FINGERPRINT_TX = 17;
-// Button 1: Main operational button (for enrolling, menus, etc.)
-const uint8_t BUTTON_PIN1 = 34; // GPIO34 is input-only, requires external pull-up resistor
-// Button 2: WiFiManager setup portal (long press)
-const uint8_t BUTTON_PIN2 = 35; // GPIO35 is input-only, requires external pull-up resistor
-// SD Card Chip Select (CS) Pin
+const uint8_t FINGERPRINT_RX = 16, FINGERPRINT_TX = 17;
+const uint8_t BUTTON_PIN1 = 34; // Requires external pull-up resistor
+const uint8_t BUTTON_PIN2 = 35; // Requires external pull-up resistor
 const uint8_t SD_CS_PIN = 5;
 
 // --- SERVER AND TIME CONFIGURATION ---
-#define SERVER_HOST "https://192.168.1.6:7069" // The base URL of your backend server
-#define NTP_SERVER "pool.ntp.org"             // Network Time Protocol server for initial time sync
-#define GMT_OFFSET_SEC 3600 * 2               // GMT offset for your timezone (e.g., UTC+2 for Egypt Standard Time)
-#define DAYLIGHT_OFFSET_SEC 0                 // Daylight saving offset (0 if not applicable)
+#define SERVER_HOST "https://192.168.1.6:7069"
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 3600 * 2
+#define DAYLIGHT_OFFSET_SEC 0
 #define OFFLINE_LOG_FILE "/attendance_log.txt"
+#define LECTURE_SCHEDULE_ENDPOINT "/api/lectures/schedule" // Endpoint to get schedule
+#define ENROLL_ENDPOINT "/api/SensorData/enroll"
+#define ATTENDANCE_ENDPOINT "/api/SensorData"
+#define LAST_ID_ENDPOINT "/api/SensorData/last-id"
+#define CLEAR_AUTH_ENDPOINT "/api/SensorData/clear"
+
 
 // --- CONSTANTS AND TIMERS ---
-const uint32_t DEBOUNCE_DELAY = 50;        // 50 ms for button debouncing
-const uint32_t LONG_PRESS_DELAY = 1000;    // 1000 ms = 1 second for a long press
-const uint32_t MENU_TIMEOUT = 10000;       // 10000 ms = 10 seconds for menu timeout
-const uint32_t SLEEP_TIMEOUT = 15000;       // 15000 ms = 15 seconds of inactivity before light sleep
+const uint32_t DEBOUNCE_DELAY = 50;
+const uint32_t LONG_PRESS_DELAY = 1000;
+const uint32_t MENU_TIMEOUT = 10000;
+const uint32_t SLEEP_TIMEOUT = 15000;
 
 // --- GLOBAL OBJECTS ---
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
-HardwareSerial fingerSerial(2); // Use Serial Port 2 for the fingerprint sensor
+HardwareSerial fingerSerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
 RTC_DS3231 rtc;
+
+// --- LECTURE SCHEDULE STORAGE ---
+// 5 days (Sat-Wed), 4 lectures per day
+uint16_t lectureSchedule[5][4];
 
 // --- STATE MANAGEMENT ---
 enum class MenuState {
   MAIN_MENU,
   OPTIONS_MENU
 };
-
 MenuState currentMenuState = MenuState::MAIN_MENU;
-uint32_t lastActivityTime = 0; // Tracks time for sleep and menu timeouts
+uint32_t lastActivityTime = 0;
 
 // --- BUTTON STATE VARIABLES ---
-uint8_t btn1State = HIGH;
-uint8_t btn2State = HIGH;
-uint32_t btn1PressTime = 0;
-uint32_t btn2PressTime = 0;
-bool btn1Held = false;
-bool btn2Held = false;
+uint8_t btn1State = HIGH, btn2State = HIGH;
+uint32_t btn1PressTime = 0, btn2PressTime = 0;
+bool btn1Held = false, btn2Held = false;
 
 // --- FUNCTION PROTOTYPES ---
-// Core System & UI
-void displayMessage(String line1, String line2 = "", int delayMs = 0);
+void displayMessage(String, String, int);
 void handleButtons();
-
-// WiFi & Server
-void setupWiFi(bool portal);
-bool logToServer(const String& endpoint, const String& payload);
-bool syncAttendanceToServer(uint16_t id, time_t timestamp);
+void setupWiFi(bool);
+bool logToServer(const String&, const String&);
+bool syncAttendanceToServer(uint16_t, uint16_t);
 uint16_t fetchLastIdFromServer();
-
-// Fingerprint Operations
 void scanForFingerprint();
 void enrollNewFingerprint();
-uint8_t getFingerprintImage(int step);
-uint8_t createAndStoreModel(uint16_t id);
-
-// SD Card and Offline Logging
+uint8_t getFingerprintImage(int);
+uint8_t createAndStoreModel(uint16_t);
 void syncOfflineLogs();
 void attemptToClearAllData();
 void setupModules();
 void setupRtcAndSyncTime();
-void logAttendanceOffline(uint16_t id, time_t timestamp);
-
-// Menu Actions
+void logAttendanceOffline(uint16_t, uint16_t);
 void showMainMenu();
 void showOptionsMenu();
-
-// Power Management
 void enterLightSleep();
+// New functions for lecture schedule
+bool fetchLectureSchedule();
+uint16_t determineCurrentLectureID(const DateTime&);
+
 
 /**************************************************************************************************
- * SETUP: Runs once on boot. Initializes all hardware and software components.
+ * SETUP: Runs once on boot.
  **************************************************************************************************/
 void setup() {
-  // Serial.begin(115200); // For debugging purposes
-  
   setupModules();
   setupRtcAndSyncTime();
-  
-  // Initial WiFi connection attempt (non-blocking)
+
   displayMessage("Connecting WiFi", "Please wait...");
   setupWiFi(false); // false = don't start config portal on boot
-  
+
   if (WiFi.status() == WL_CONNECTED) {
-    displayMessage("WiFi Connected!", WiFi.localIP().toString(), 2000);
-    syncOfflineLogs(); // Sync any logs stored on SD card
+    displayMessage("WiFi Connected!", WiFi.localIP().toString(), 1500);
+    if(fetchLectureSchedule()){
+        displayMessage("Schedule OK!", "Syncing logs...", 1500);
+        syncOfflineLogs();
+    } else {
+        displayMessage("Schedule FAIL", "Check Server", 3000);
+    }
   } else {
     displayMessage("Offline Mode", "RTC Time Active", 2000);
   }
 
-  lastActivityTime = millis(); // Initialize activity timer
+  lastActivityTime = millis();
   showMainMenu();
 }
 
 /**************************************************************************************************
- * LOOP: Main program cycle. Handles buttons, fingerprint scanning, and power management.
+ * LOOP: Main program cycle.
  **************************************************************************************************/
 void loop() {
   handleButtons();
 
-  // Only scan for fingerprints when in the main menu and no buttons are being pressed.
   if (currentMenuState == MenuState::MAIN_MENU && !btn1PressTime && !btn2PressTime) {
     scanForFingerprint();
   }
 
-  // Check for menu timeout in the options menu
   if (currentMenuState == MenuState::OPTIONS_MENU && (millis() - lastActivityTime > MENU_TIMEOUT)) {
       displayMessage("Timeout", "Returning...", 1500);
       showMainMenu();
   }
   
-  // Check for inactivity to enter light sleep
   if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
     enterLightSleep();
   }
 }
 
 /**************************************************************************************************
- * Core System & UI Functions                                    *
+ * Core System & UI Functions
  **************************************************************************************************/
 
-/**
- * @brief Initializes LCD, SD Card, Fingerprint Sensor, and Buttons.
- */
 void setupModules() {
-  // --- LCD Setup ---
   lcd.begin(16, 2);
   displayMessage("System Booting", "Please wait...");
   delay(2000);
 
-  // --- SD Card Setup ---
   if (!SD.begin(SD_CS_PIN)) {
     displayMessage("SD Card Error!", "Check wiring.", 5000);
-    // Depending on requirements, you could halt or just disable SD logging.
-    // For now, we continue, but offline logging will fail.
   }
 
-  // --- Fingerprint Sensor Setup ---
   fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
   if (finger.verifyPassword()) {
     displayMessage("Fingerprint", "Sensor OK!", 1500);
   } else {
     displayMessage("Fingerprint", "Sensor Error!", 5000);
-    while(1) { delay(1); } // Halt on critical error
+    while(1) { delay(1); }
   }
-  finger.getTemplateCount(); // Get number of stored templates
-  // Serial.print("Sensor contains "); Serial.print(finger.templateCount); Serial.println(" templates.");
 
-
-  // --- Button Setup ---
-  // GPIO 34 & 35 are input only and need external pull-up resistors.
   pinMode(BUTTON_PIN1, INPUT); 
   pinMode(BUTTON_PIN2, INPUT);
 }
 
-/**
- * @brief Initializes the RTC and syncs it with an NTP server if online.
- */
 void setupRtcAndSyncTime() {
   if (!rtc.begin()) {
     displayMessage("RTC Error!", "Check wiring.", 5000);
-    while (1) { delay(1); } // Halt on critical error
+    while (1) { delay(1); }
   }
   
   if (rtc.lostPower()) {
     displayMessage("RTC Power Lost!", "Syncing time...", 2000);
-    // If WiFi is connected later, time will be synced. If not, it will use the time it was compiled.
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
 }
 
-/**
- * @brief Displays a two-line message on the LCD. Clears the screen first.
- * @param line1 Text for the first row.
- * @param line2 Text for the second row (optional).
- * @param delayMs Duration to show the message before returning (optional).
- */
-void displayMessage(String line1, String line2, int delayMs) {
+void displayMessage(String line1, String line2 = "", int delayMs = 0) {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(line1);
+  lcd.print(line1.substring(0, 16));
   lcd.setCursor(0, 1);
-  lcd.print(line2);
+  lcd.print(line2.substring(0, 16));
   if (delayMs > 0) {
     delay(delayMs);
   }
 }
 
-/**
- * @brief Enters light sleep to save power and configures buttons to wake the ESP32.
- */
 void enterLightSleep() {
-    displayMessage("Entering sleep...", "Press btn2 to wake", 2000);
-    lcd.noDisplay(); // Turn off LCD backlight if controlled by a transistor
-
-    // Enable wakeup from button2 (active LOW)
-    esp_sleep_enable_ext0_wakeup(BUTTON_PIN2, 0); 
-
+    displayMessage("Entering sleep...", "Press btn to wake", 2000);
+    lcd.noDisplay();
+    // Wake on either button
+    esp_sleep_enable_ext1_wakeup((1ULL << BUTTON_PIN1) | (1ULL << BUTTON_PIN2), ESP_EXT1_WAKEUP_ANY_HIGH);
     esp_light_sleep_start();
-
     // --- Code execution resumes here after wakeup ---
     lcd.display();
-    lastActivityTime = millis(); // Reset activity timer upon waking
+    lastActivityTime = millis();
     showMainMenu();
 }
 
-
 /**************************************************************************************************
- * Button Handling Logic                                        *
+ * Button Handling Logic
  **************************************************************************************************/
-
-/**
- * @brief Manages button states, debouncing, and press/hold detection.
- */
 void handleButtons() {
-    // --- Read current button states ---
     uint8_t currentBtn1 = digitalRead(BUTTON_PIN1);
     uint8_t currentBtn2 = digitalRead(BUTTON_PIN2);
 
     // --- Button 1 Logic (Add/Options) ---
-    if (currentBtn1 != btn1State) {
-        btn1PressTime = millis(); // Start timer on state change
+    if (currentBtn1 == LOW && btn1State == HIGH && (millis() - btn1PressTime > DEBOUNCE_DELAY)) {
+        btn1PressTime = millis();
+    }
+    if(btn1State == LOW && currentBtn1 == HIGH){ // Released
+        if(!btn1Held){ // Short Press
+            lastActivityTime = millis();
+            if (currentMenuState == MenuState::MAIN_MENU) { enrollNewFingerprint(); }
+        }
         btn1Held = false;
+        btn1PressTime = 0;
+    }
+    if (btn1PressTime != 0 && !btn1Held && (millis() - btn1PressTime > LONG_PRESS_DELAY)) { // Held
+        btn1Held = true;
+        lastActivityTime = millis();
+        if (currentMenuState == MenuState::MAIN_MENU) { showOptionsMenu(); } 
+        else if (currentMenuState == MenuState::OPTIONS_MENU) { attemptToClearAllData(); }
     }
     btn1State = currentBtn1;
 
-    if (btn1PressTime && (millis() - btn1PressTime > DEBOUNCE_DELAY)) {
-        if (btn1State == LOW) { // Button is pressed
-            if (!btn1Held && (millis() - btn1PressTime > LONG_PRESS_DELAY)) {
-                // --- LONG PRESS ACTION ---
-                btn1Held = true;
-                lastActivityTime = millis();
-                if (currentMenuState == MenuState::MAIN_MENU) {
-                    showOptionsMenu();
-                } else if (currentMenuState == MenuState::OPTIONS_MENU) {
-                    attemptToClearAllData();
-                }
-            }
-        } else { // Button is released
-            if (!btn1Held) {
-                // --- SHORT PRESS ACTION ---
-                lastActivityTime = millis();
-                if (currentMenuState == MenuState::MAIN_MENU) {
-                    enrollNewFingerprint();
-                }
-            }
-            btn1PressTime = 0; // Reset timer
-        }
-    }
-
-    // --- Button 2 Logic (WiFi Manager) ---
-    if (currentBtn2 != btn2State) {
+    // --- Button 2 Logic (WiFi Manager / Wake) ---
+     if (currentBtn2 == LOW && btn2State == HIGH && (millis() - btn2PressTime > DEBOUNCE_DELAY)) {
         btn2PressTime = millis();
+    }
+    if(btn2State == LOW && currentBtn2 == HIGH){ // Released
         btn2Held = false;
+        btn2PressTime = 0;
+    }
+    if (btn2PressTime != 0 && !btn2Held && (millis() - btn2PressTime > LONG_PRESS_DELAY)) { // Held
+        btn2Held = true;
+        lastActivityTime = millis();
+        setupWiFi(true);
+        showMainMenu();
     }
     btn2State = currentBtn2;
-
-    if (btn2PressTime && (millis() - btn2PressTime > DEBOUNCE_DELAY)) {
-         if (btn2State == LOW) { // Button is pressed
-            if (!btn2Held && (millis() - btn2PressTime > LONG_PRESS_DELAY)) {
-                 // --- LONG PRESS ACTION ---
-                btn2Held = true;
-                lastActivityTime = millis();
-                setupWiFi(true); // true = start config portal
-                showMainMenu();
-            }
-        } else { // Button is released
-             btn2PressTime = 0; // Reset timer
-        }
-    }
 }
 
 
 /**************************************************************************************************
- * WiFi & Server Functions                                      *
+ * Lecture Schedule Functions
  **************************************************************************************************/
+/**
+ * @brief Fetches the weekly lecture schedule from the server.
+ * @return True on success, false on failure.
+ */
+bool fetchLectureSchedule() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    String url = String(SERVER_HOST) + LECTURE_SCHEDULE_ENDPOINT;
+    http.begin(url);
+    
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        DynamicJsonDocument doc(2048); // Adjust size as needed
+        deserializeJson(doc, http.getString());
+        
+        JsonArray days = doc.as<JsonArray>();
+        if (days.size() != 5) return false; // Expect 5 working days
+
+        int dayIndex = 0;
+        for (JsonArray day_lectures : days) {
+            if (day_lectures.size() != 4) return false; // Expect 4 lectures per day
+            int lectureIndex = 0;
+            for (JsonVariant id : day_lectures) {
+                lectureSchedule[dayIndex][lectureIndex] = id.as<uint16_t>();
+                lectureIndex++;
+            }
+            dayIndex++;
+        }
+        http.end();
+        return true;
+    } else {
+        http.end();
+        return false;
+    }
+}
 
 /**
- * @brief Sets up WiFi. Can start a configuration portal if requested.
- * @param portal If true, starts the WiFiManager portal for configuration.
+ * @brief Determines the current lecture ID based on day and time.
+ * @param now The current DateTime object from the RTC.
+ * @return The lecture ID, or 0 if no lecture is active.
  */
+uint16_t determineCurrentLectureID(const DateTime& now) {
+    // RTClib: Sunday=0, Monday=1, ..., Saturday=6
+    // Our schedule: Saturday=0, Sunday=1, ..., Wednesday=4
+    int dayOfWeek = now.dayOfTheWeek();
+    int scheduleDay = -1;
+
+    if (dayOfWeek == 6) scheduleDay = 0; // Saturday
+    else if (dayOfWeek >= 0 && dayOfWeek <= 3) scheduleDay = dayOfWeek + 1; // Sunday-Wednesday
+    else return 0; // It's Thursday or Friday
+
+    int hour = now.hour();
+    int minute = now.minute();
+
+    if (hour == 9 || (hour == 10 && minute < 30)) { // 9:00 - 10:29
+        return lectureSchedule[scheduleDay][0];
+    } else if ((hour == 10 && minute >= 30) || hour == 11) { // 10:30 - 11:59
+        return lectureSchedule[scheduleDay][1];
+    } else if ((hour == 12 && minute >= 30) || hour == 13) { // 12:30 - 13:59
+        return lectureSchedule[scheduleDay][2];
+    } else if (hour == 14 || (hour == 15 && minute < 30)) { // 14:00 - 15:29
+        return lectureSchedule[scheduleDay][3];
+    }
+
+    return 0; // Not within any lecture time
+}
+
+/**************************************************************************************************
+ * WiFi & Server Functions
+ **************************************************************************************************/
+
 void setupWiFi(bool portal) {
   WiFiManager wm;
-  wm.setConnectTimeout(20); // Set connect timeout to 20 seconds
+  wm.setConnectTimeout(20);
   
   if (portal) {
     displayMessage("Setup Mode", "Connect to AP...", 0);
-    // Starts a blocking portal. ESP will reset after successful configuration.
     if (!wm.startConfigPortal("FingerprintSetupAP")) {
       displayMessage("Setup Failed", "No credentials.", 2000);
     } else {
@@ -337,11 +344,9 @@ void setupWiFi(bool portal) {
       ESP.restart();
     }
   } else {
-    // Auto-connects with saved credentials without blocking
     wm.autoConnect("FingerprintSetupAP");
   }
 
-  // After any connection attempt, sync time if connected
   if (WiFi.status() == WL_CONNECTED) {
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
     struct tm timeinfo;
@@ -352,10 +357,6 @@ void setupWiFi(bool portal) {
   }
 }
 
-/**
- * @brief Fetches the last used fingerprint ID from the server.
- * @return The last ID as a uint16_t, or 0 on failure.
- */
 uint16_t fetchLastIdFromServer() {
   if (WiFi.status() != WL_CONNECTED) {
     displayMessage("No WiFi", "Cannot get ID", 2000);
@@ -363,140 +364,111 @@ uint16_t fetchLastIdFromServer() {
   }
   
   HTTPClient http;
-  String url = String(SERVER_HOST) + "/api/SensorData/last-id";
-  
-  http.begin(url); 
+  String url = String(SERVER_HOST) + LAST_ID_ENDPOINT;
+  http.begin(url);
 
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
+    uint16_t id = http.getString().toInt();
     http.end();
-    return (uint16_t)payload.toInt();
+    return id;
   } else {
     displayMessage("Server Error", "Code: " + String(httpCode), 2000);
     http.end();
-    return -1; // Return -1 to indicate failure
+    return 0; // Return 0 to indicate failure
   }
 }
 
-/**
- * @brief Sends attendance data to the server.
- * @param id The user's fingerprint ID.
- * @param timestamp The Unix timestamp of the attendance.
- * @return True on success, false on failure.
- */
-bool syncAttendanceToServer(uint16_t id, time_t timestamp) {
+bool syncAttendanceToServer(uint16_t fingerID, uint16_t lectureID) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   StaticJsonDocument<128> doc;
-  doc["id"] = id;
-  doc["timestamp"] = timestamp;
+  doc["fingerid"] = fingerID;
+  doc["lectureid"] = lectureID;
 
   String payload;
   serializeJson(doc, payload);
 
-  return logToServer("/api/SensorData", payload);
+  return logToServer(ATTENDANCE_ENDPOINT, payload);
 }
 
-/**
- * @brief Sends a generic POST request to a server endpoint.
- * @param endpoint The API endpoint (e.g., "/api/SensorData/enroll").
- * @param payload The JSON string to send in the request body.
- * @return True if the server returns a 2xx success code, false otherwise.
- */
 bool logToServer(const String& endpoint, const String& payload) {
     if (WiFi.status() != WL_CONNECTED) return false;
-
     HTTPClient http;
     String url = String(SERVER_HOST) + endpoint;
     http.begin(url); 
     http.addHeader("Content-Type", "application/json");
-
     int httpCode = http.POST(payload);
     http.end();
-
-    return (httpCode >= 200 && httpCode < 300); // Return true for any 2xx success codes
+    return (httpCode >= 200 && httpCode < 300);
 }
 
 
 /**************************************************************************************************
- * Fingerprint Operation Functions                                 *
+ * Fingerprint Operation Functions
  **************************************************************************************************/
 
-/**
- * @brief Continuously scans for a fingerprint and logs attendance if a match is found.
- */
 void scanForFingerprint() {
-  // Wait for a finger to be placed on the sensor
   uint8_t p = finger.getImage();
   if (p != FINGERPRINT_OK) return;
 
-  // Convert the image to a feature template
   p = finger.image2Tz();
   if (p != FINGERPRINT_OK) return;
 
-  // Search the sensor's internal database for a match
   p = finger.fingerSearch();
   if (p == FINGERPRINT_OK) {
     lastActivityTime = millis();
     uint16_t fingerID = finger.fingerID;
-    displayMessage("Welcome!", "ID: " + String(fingerID), 2000);
     
-    // Log the attendance (this function handles online/offline logic)
     DateTime now = rtc.now();
-    if(syncAttendanceToServer(fingerID, now.unixtime())){
-        displayMessage("Attendance Sent!", "", 1500);
+    uint16_t lectureID = determineCurrentLectureID(now);
+
+    if (lectureID == 0) {
+        displayMessage("Welcome ID:" + String(fingerID), "No Lecture Now", 2000);
+        showMainMenu();
+        return;
+    }
+
+    displayMessage("ID:" + String(fingerID) + " LECT:" + lectureID, "Logging...", 2000);
+    
+    if(syncAttendanceToServer(fingerID, lectureID)){
+        displayMessage("Attendance Sent!", "Thank You", 1500);
     } else {
-        displayMessage("Saved Offline", "", 1500);
-        logAttendanceOffline(fingerID, now.unixtime());
+        displayMessage("Saved Offline", "Will sync later", 1500);
+        logAttendanceOffline(fingerID, lectureID);
     }
     showMainMenu();
-  } else {
-    displayMessage("Finger not Found", "Try again: " + String(fingerID), 500);
   }
 }
 
 
-/**
- * @brief Manages the multi-step process of enrolling a new user.
- */
 void enrollNewFingerprint() {
   displayMessage("Enrollment:", "Fetching ID...");
   uint16_t newId = fetchLastIdFromServer() + 1;
 
-  if (WiFi.status() != WL_CONNECTED) {
-      displayMessage("Enroll Failed", "Check WiFi", 2000);
-      showMainMenu();
-      return;
+  if (newId == 1 && WiFi.status() != WL_CONNECTED) { // Check if fetch failed due to WiFi
+    displayMessage("Enroll Failed", "Check WiFi", 2000);
+    showMainMenu(); return;
   }
-  if (newId == 0) { // fetchLastId returns -1 on failure, so newId becomes 0
+  if (newId == 1 && fetchLastIdFromServer() == 0) { // Check if server returned 0
     displayMessage("Enroll Failed", "Check Server", 2000);
-    showMainMenu();
-    return;
+    showMainMenu(); return;
   }
   
   displayMessage("Place finger", "ID: " + String(newId));
-  if (getFingerprintImage(1) != FINGERPRINT_OK) {
-      showMainMenu();
-      return;
-  }
+  if (getFingerprintImage(1) != FINGERPRINT_OK) { showMainMenu(); return; }
   
   displayMessage("Place again", "ID: " + String(newId));
-  if (getFingerprintImage(2) != FINGERPRINT_OK) {
-      showMainMenu();
-      return;
-  }
+  if (getFingerprintImage(2) != FINGERPRINT_OK) { showMainMenu(); return; }
   
   displayMessage("Creating model", "Please wait...");
   if (createAndStoreModel(newId) == FINGERPRINT_OK) {
       displayMessage("Enrolled!", "ID: " + String(newId), 2000);
-      
-      // Send the new ID to the server
       StaticJsonDocument<64> doc;
       doc["id"] = newId;
       String payload;
       serializeJson(doc, payload);
-      if(!logToServer("/api/SensorData/enroll", payload)) {
+      if(!logToServer(ENROLL_ENDPOINT, payload)) {
           displayMessage("Server Sync Failed", "Enrollment local", 2000);
       }
   } else {
@@ -505,16 +477,10 @@ void enrollNewFingerprint() {
   showMainMenu();
 }
 
-/**
- * @brief Gets a single fingerprint image and converts it to a template.
- * @param step The step in the enrollment process (1 or 2).
- * @return Fingerprint status code (e.g., FINGERPRINT_OK).
- */
 uint8_t getFingerprintImage(int step) {
   uint8_t p = -1;
   while (p != FINGERPRINT_OK) {
     p = finger.getImage();
-    // Allow user to cancel by pressing button 1
     if (digitalRead(BUTTON_PIN1) == LOW) return FINGERPRINT_ENROLLMISMATCH;
   }
   
@@ -528,57 +494,41 @@ uint8_t getFingerprintImage(int step) {
   }
 }
 
-/**
- * @brief Combines the two stored templates into a single model and saves it to flash.
- * @param id The ID to store the model against.
- * @return Fingerprint status code.
- */
 uint8_t createAndStoreModel(uint16_t id) {
   uint8_t p = finger.createModel();
   if (p != FINGERPRINT_OK) {
     displayMessage("Model Error", "Try again", 2000);
     return p;
   }
-
   p = finger.storeModel(id);
-  if (p == FINGERPRINT_OK) {
-    return p;
-  } else {
+  if (p != FINGERPRINT_OK) {
     displayMessage("Storage Error", "Code: " + String(p), 2000);
-    return p;
   }
+  return p;
 }
 
 
 /**************************************************************************************************
- * SD Card and Offline Logging                                      *
+ * SD Card and Offline Logging
  **************************************************************************************************/
 
-/**
- * @brief Logs an attendance record to the SD card.
- * @param id The user's fingerprint ID.
- * @param timestamp The Unix timestamp of the attendance.
- */
-void logAttendanceOffline(uint16_t id, time_t timestamp) {
+void logAttendanceOffline(uint16_t id, uint16_t lectureId) {
   File logFile = SD.open(OFFLINE_LOG_FILE, FILE_APPEND);
   if (logFile) {
-    logFile.print(String(id) + "," + String(timestamp) + "\n");
+    logFile.println(String(id) + "," + String(lectureId));
     logFile.close();
   } else {
     displayMessage("SD Write Error!", "", 2000);
   }
 }
 
-/**
- * @brief Reads logs from the SD card and attempts to sync them to the server.
- */
 void syncOfflineLogs() {
-  displayMessage("Syncing logs...", "", 0);
   File logFile = SD.open(OFFLINE_LOG_FILE, FILE_READ);
-  if (!logFile) {
-    displayMessage("No offline logs", "to sync.", 1500);
-    return;
+  if (!logFile || !logFile.size()) {
+    if(logFile) logFile.close();
+    return; // No file or empty file
   }
+  displayMessage("Syncing logs...", "", 0);
 
   String tempLogName = "/temp_log.txt";
   File tempFile = SD.open(tempLogName, FILE_WRITE);
@@ -592,12 +542,9 @@ void syncOfflineLogs() {
     int commaIndex = line.indexOf(',');
     if (commaIndex != -1) {
       uint16_t id = line.substring(0, commaIndex).toInt();
-      time_t timestamp = (time_t)line.substring(commaIndex + 1).toInt();
+      uint16_t lectureId = line.substring(commaIndex + 1).toInt();
 
-      if (syncAttendanceToServer(id, timestamp)) {
-        // Log was sent successfully, so we don't write it to the temp file.
-      } else {
-        // Failed to send, so write it to the temp file to keep it.
+      if (!syncAttendanceToServer(id, lectureId)) {
         allSynced = false;
         if(tempFile) tempFile.println(line);
       }
@@ -607,40 +554,31 @@ void syncOfflineLogs() {
   logFile.close();
   if(tempFile) tempFile.close();
 
-  // Replace the old log file with the new one containing only unsynced logs.
   SD.remove(OFFLINE_LOG_FILE);
   if (!allSynced) {
     SD.rename(tempLogName, OFFLINE_LOG_FILE);
     displayMessage("Sync complete.", "Some logs remain.", 2000);
   } else {
-    SD.remove(tempLogName); // Remove the empty temp file
+    SD.remove(tempLogName);
     displayMessage("Sync complete!", "All logs sent.", 2000);
   }
 }
 
 /**************************************************************************************************
- * Menu Actions                                              *
+ * Menu Actions
  **************************************************************************************************/
-
-/**
- * @brief Shows the options menu on the LCD.
- */
 void showOptionsMenu() {
   currentMenuState = MenuState::OPTIONS_MENU;
   displayMessage("Hold btn1: Clear", "Timeout: 10s");
-  lastActivityTime = millis(); // Reset timer for menu timeout
-}
-/**
- * @brief Shows the main menu on the LCD.
- */
-void showMainMenu() {
-  currentMenuState = MenuState::MAIN_MENU;
-  displayMessage("btn1:add/options", "btn2hold:wifi");
   lastActivityTime = millis();
 }
-/**
- * @brief Contacts the server for authorization and then deletes all fingerprint data.
- */
+
+void showMainMenu() {
+  currentMenuState = MenuState::MAIN_MENU;
+  displayMessage("Scan Finger or", "Press Button");
+  lastActivityTime = millis();
+}
+
 void attemptToClearAllData() {
   displayMessage("Authorizing...", "Please wait", 0);
   
@@ -651,7 +589,7 @@ void attemptToClearAllData() {
   }
 
   HTTPClient http;
-  String url = String(SERVER_HOST) + "/api/SensorData/clear";
+  String url = String(SERVER_HOST) + CLEAR_AUTH_ENDPOINT;
   http.begin(url);
   int httpCode = http.GET();
   http.end();
@@ -666,6 +604,5 @@ void attemptToClearAllData() {
   } else {
       displayMessage("Authorization", "Failed! Code: " + String(httpCode), 3000);
   }
-  
   showMainMenu();
 }
