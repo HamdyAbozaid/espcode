@@ -233,12 +233,11 @@ void displayMessage(String line1, String line2, int delayMs) {
  * @brief Enters light sleep to save power and configures buttons to wake the ESP32.
  */
 void enterLightSleep() {
-    displayMessage("Entering sleep...", "Press btn to wake", 2000);
+    displayMessage("Entering sleep...", "Press btn2 to wake", 2000);
     lcd.noDisplay(); // Turn off LCD backlight if controlled by a transistor
 
-    // Enable wakeup from either button (active LOW)
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 0); 
-    esp_sleep_enable_ext1_wakeup((1ULL << BUTTON_PIN1) | (1ULL << BUTTON_PIN2), ESP_EXT1_WAKEUP_ANY_HIGH); // This might need adjustment depending on your button circuit (pull-up vs pull-down)
+    // Enable wakeup from button2 (active LOW)
+    esp_sleep_enable_ext0_wakeup(BUTTON_PIN2, 0); 
 
     esp_light_sleep_start();
 
