@@ -395,7 +395,7 @@ bool syncAttendanceToServer(uint16_t id, time_t timestamp) {
   String payload;
   serializeJson(doc, payload);
 
-  return logToServer("/api/SensorData/attendance", payload);
+  return logToServer("/api/SensorData", payload);
 }
 
 /**
