@@ -1,23 +1,29 @@
 /**************************************************************************************************
  * Multi-Device Fingerprint Attendance System
- * Version: 1.6 (Production Ready)
+ * Version: 1.7 (Final Corrected)
  *
- * Description:
- * A comprehensive and robust fingerprint attendance system designed for multi-device deployment.
- * Fingerprint templates are managed by a central server and synchronized to each device on boot
- * or on-demand. This provides a scalable solution for multiple rooms. The user interface is
- * streamlined for ease of use.
+ * -----------------------------------------------------------------------------------------------
+ * !!! IMPORTANT !!!
+ * -----------------------------------------------------------------------------------------------
+ * PRE-REQUISITES FOR COMPILATION:
  *
- * Key Features:
- * - Simplified Menu: btn1 for enrollment, btn2 for sync (short press) or WiFi setup (long press).
- * - On-Demand Sync: Manually trigger a full sync of fingerprints and offline attendance logs.
- * - Wake Without Action: Waking the device from sleep does not trigger an immediate function.
- * - Centralized Fingerprints: Enroll on one device, recognize on all others after sync.
- * - Room-Based Logging: Each device is configured with a static ROOM_ID for location tracking.
- * - Offline-First Design: Seamlessly saves logs to an SD card if the network is down and
- * syncs automatically when connectivity is restored.
- * - Robust Error Handling: Provides clear user feedback on the LCD for most common errors.
- * - Low-Power Mode: Enters light sleep during periods of inactivity to conserve power.
+ * 1. MODIFY THE ADAFRUIT FINGERPRINT LIBRARY:
+ * You MUST make two small changes to "Adafruit_Fingerprint.h" for this code to work.
+ * a) Add a default constructor to the packet struct:
+ * In 'struct Adafruit_Fingerprint_Packet', add the line:
+ * Adafruit_Fingerprint_Packet() {}
+ *
+ * b) Expose the template buffer in the main class:
+ * In 'class Adafruit_Fingerprint', under 'public:', add the line:
+ * uint8_t templateBuffer[512];
+ *
+ * 2. INSTALL THE CORRECT LIBRARIES:
+ * This code requires the following libraries to be installed via the Library Manager:
+ * - Adafruit Fingerprint Sensor Library
+ * - RTClib
+ * - ArduinoJson
+ * - WiFiManager
+ * - Base64 by Densaugeo  <-- The 'base64...' errors mean this is not installed!
  *
  **************************************************************************************************/
 
@@ -31,13 +37,10 @@
 #include <RTClib.h>
 #include <SD.h>
 #include <SPI.h>
-#include "Base64.h" // For encoding/decoding templates. Requires library by Densaugeo.
+#include "base64.hpp"
 
 // --- FIXED DEFINITIONS FOR FINGERPRINT LIBRARY COMPATIBILITY ---
-// This command is used to download a template from the host (ESP32) to the sensor.
-// It was missing from the user-provided header file.
 #define FINGERPRINT_DOWNCHAR 0x09 
-// The size of a standard fingerprint template file. This was also missing from the header.
 #define FINGERPRINT_TEMPLATE_SIZE 512
 
 // --- DEVICE CONFIGURATION ---
@@ -53,7 +56,7 @@ const uint8_t SD_CS_PIN = 5;
 // --- SERVER AND TIME CONFIGURATION ---
 #define SERVER_HOST "https://192.168.1.6:7069"
 #define NTP_SERVER "pool.ntp.org"
-#define GMT_OFFSET_SEC 3600 * 2 // For Egypt Standard Time (UTC+2)
+#define GMT_OFFSET_SEC 3600 * 2
 #define DAYLIGHT_OFFSET_SEC 0
 #define OFFLINE_LOG_FILE "/attendance_log.txt"
 
@@ -64,8 +67,8 @@ const uint8_t SD_CS_PIN = 5;
 #define FP_LAST_ID_ENDPOINT "/api/SensorData/last-id"
 
 // --- CONSTANTS AND TIMERS ---
-const uint32_t LONG_PRESS_DELAY = 1500; // 1.5 seconds for a long press
-const uint32_t SLEEP_TIMEOUT = 30000;   // 30 seconds of inactivity before sleep
+const uint32_t LONG_PRESS_DELAY = 1500;
+const uint32_t SLEEP_TIMEOUT = 30000;
 
 // --- GLOBAL OBJECTS ---
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
@@ -75,7 +78,7 @@ RTC_DS3231 rtc;
 
 // --- STATE MANAGEMENT ---
 uint32_t lastActivityTime = 0;
-bool justWokeUp = false; // Flag to prevent action on wake
+bool justWokeUp = false;
 
 // --- FUNCTION PROTOTYPES ---
 void displayMessage(String, String, int);
@@ -99,57 +102,43 @@ uint8_t uploadTemplate(uint8_t*, uint16_t);
 
 /**************************************************************************************************
  * uploadTemplate
- * Helper function to upload a raw template buffer to the sensor's CharBuffer1 using the
- * public packet methods available in your specific library version. This is the key
- * function to enable syncing from server to device.
- *
- * @param template_buffer Pointer to the byte array containing the template.
- * @param template_size   The size of the template.
- * @return FINGERPRINT_OK on success, or an error code on failure.
  **************************************************************************************************/
 uint8_t uploadTemplate(uint8_t* template_buffer, uint16_t template_size) {
-    // Step 1: Send the 'DownChar' command to indicate we are about to send a template file
-    uint8_t command_payload[] = {FINGERPRINT_DOWNCHAR, 1}; // Instruction: DownChar, Argument: Use CharBuffer1
+    uint8_t command_payload[] = {FINGERPRINT_DOWNCHAR, 1}; 
     Adafruit_Fingerprint_Packet command_packet(FINGERPRINT_COMMANDPACKET, sizeof(command_payload), command_payload);
     finger.writeStructuredPacket(command_packet);
 
-    Adafruit_Fingerprint_Packet response_packet;
+    Adafruit_Fingerprint_Packet response_packet; // This now works due to the default constructor
     uint8_t p = finger.getStructuredPacket(&response_packet);
     if (p != FINGERPRINT_OK || response_packet.type != FINGERPRINT_ACKPACKET) {
-        return FINGERPRINT_PACKETRECIEVEERR; // Failed to get ACK for command
+        return FINGERPRINT_PACKETRECIEVEERR;
     }
 
-    // Step 2: Send the template data itself in multiple data packets
     uint16_t bytes_sent = 0;
     while (bytes_sent < template_size) {
-        // Your library version's packet structure handles a max of 64 data bytes per packet
         uint16_t to_send = min((uint16_t)(template_size - bytes_sent), (uint16_t)64);
-        
         uint8_t packet_type = (bytes_sent + to_send >= template_size) ? FINGERPRINT_ENDDATAPACKET : FINGERPRINT_DATAPACKET;
-        
         Adafruit_Fingerprint_Packet data_packet(packet_type, to_send, template_buffer + bytes_sent);
         finger.writeStructuredPacket(data_packet);
-        
         p = finger.getStructuredPacket(&response_packet);
         if (p != FINGERPRINT_OK || response_packet.type != FINGERPRINT_ACKPACKET) {
-            return FINGERPRINT_UPLOADFAIL; // Failed to get ACK for data packet
+            return FINGERPRINT_UPLOADFAIL;
         }
         bytes_sent += to_send;
     }
-    
     return FINGERPRINT_OK;
 }
 
 
 /**************************************************************************************************
- * SETUP: Runs once on boot to initialize all systems.
+ * SETUP
  **************************************************************************************************/
 void setup() {
   setupModules();
   setupRtcAndSyncTime();
 
   displayMessage("Connecting WiFi", "Please wait...", 100);
-  setupWiFi(false); // `false` = don't start config portal on boot, just try to connect
+  setupWiFi(false);
 
   if (WiFi.status() == WL_CONNECTED) {
     displayMessage("WiFi Connected!", "Syncing...", 2000);
@@ -164,17 +153,13 @@ void setup() {
 }
 
 /**************************************************************************************************
- * LOOP: Main program cycle. Handles buttons, scanning, and sleep.
+ * LOOP
  **************************************************************************************************/
 void loop() {
   handleButtons();
-  
-  // Only scan for fingerprints if no buttons are being actively pressed to prevent conflicts.
   if (digitalRead(BUTTON_PIN1) == HIGH && digitalRead(BUTTON_PIN2) == HIGH) {
     scanForFingerprint();
   }
-
-  // Check for inactivity to enter light sleep
   if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
     enterLightSleep();
   }
@@ -194,17 +179,17 @@ void setupModules() {
   fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
   if (!finger.verifyPassword()) {
     displayMessage("Fingerprint", "Sensor Error!", 5000);
-    while(1) { delay(1); } // Halt on critical sensor error
+    while(1) { delay(1); }
   }
   
-  pinMode(BUTTON_PIN1, INPUT); 
-  pinMode(BUTTON_PIN2, INPUT);
+  pinMode(BUTTON_PIN1, INPUT_PULLUP); 
+  pinMode(BUTTON_PIN2, INPUT_PULLUP);
 }
 
 void setupRtcAndSyncTime() {
   if (!rtc.begin()) { 
     displayMessage("RTC Error!", "Check wiring.", 5000); 
-    while (1) { delay(1); } // Halt on critical RTC error
+    while (1) { delay(1); }
   }
   if (rtc.lostPower()) { 
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); 
@@ -228,70 +213,62 @@ void showMainMenu() {
 void enterLightSleep() {
     displayMessage("Entering sleep...", "", 1000);
     lcd.noDisplay();
-
     esp_sleep_enable_ext1_wakeup((1ULL << BUTTON_PIN1) | (1ULL << BUTTON_PIN2), ESP_EXT1_WAKEUP_ANY_HIGH);
-    
     esp_light_sleep_start();
-
-    // --- EXECUTION RESUMES HERE AFTER WAKEUP ---
     justWokeUp = true;
     lcd.display();
     showMainMenu();
 }
 
 /**************************************************************************************************
- * Button Handling and On-Demand Sync
+ * Button Handling
  **************************************************************************************************/
 void handleButtons() {
+    // This simplified logic handles button presses on release and filters out actions on wake
+    static bool btn1_was_pressed = false;
+    static bool btn2_was_pressed = false;
     static uint32_t btn2_press_time = 0;
-    static bool btn2_long_press_acted = false;
 
-    // Any button interaction resets the sleep timer
-    if (digitalRead(BUTTON_PIN1) == LOW || digitalRead(BUTTON_PIN2) == LOW) {
-        lastActivityTime = millis();
-    }
+    lastActivityTime = millis(); // Reset sleep timer on any activity
 
-    // --- Button 1: Enroll (Short Press on Release) ---
+    // Button 1 (Enroll) logic
     if (digitalRead(BUTTON_PIN1) == LOW) {
-        // Button is pressed, do nothing until release
-    } else { // Button is released
-        if (justWokeUp) {
-            justWokeUp = false; // Consume the wake-up action, do nothing
-        } else {
-            // Check if this was a press-and-release action for button 1
-            // This simple logic assumes button 1 isn't used for waking, which it is.
-            // To be more robust, we check if the button was just pressed before this release.
-            // For simplicity, we assume any release when not just woken is an action.
-            // The original logic was complex; a simple digitalRead check on release is sufficient
-            // if we filter by the justWokeUp flag.
-            enrollNewFingerprint();
+        btn1_was_pressed = true;
+    } else {
+        if (btn1_was_pressed) {
+            btn1_was_pressed = false;
+            if (!justWokeUp) {
+                enrollNewFingerprint();
+            }
         }
     }
 
-    // --- Button 2: Sync (Short Press) / WiFi (Long Press) ---
-    if (digitalRead(BUTTON_PIN2) == LOW) { // Button is being pressed
-        if (btn2_press_time == 0) {
-          btn2_press_time = millis();
-          btn2_long_press_acted = false;
+    // Button 2 (Sync/WiFi) logic
+    if (digitalRead(BUTTON_PIN2) == LOW) {
+        if (!btn2_was_pressed) {
+            btn2_press_time = millis();
         }
-        // Check for long press while held down
-        if (!btn2_long_press_acted && (millis() - btn2_press_time >= LONG_PRESS_DELAY)) {
+        btn2_was_pressed = true;
+    } else {
+        if (btn2_was_pressed) {
+            btn2_was_pressed = false;
             if (!justWokeUp) {
-                btn2_long_press_acted = true;
-                setupWiFi(true); // Long Press Action
-                showMainMenu(); // Return to main menu after WiFi setup attempt
+                if (millis() - btn2_press_time < LONG_PRESS_DELAY) {
+                    forceSync(); // Short press
+                }
             }
-        }
-    } else { // Button is released
-        if (btn2_press_time > 0) { // It was previously pressed
-            if (justWokeUp) {
-                justWokeUp = false; // Consume wake-up action
-            } else if (!btn2_long_press_acted) {
-                forceSync(); // Short Press Action
-            }
-            btn2_press_time = 0; // Reset timer
         }
     }
+    
+    // Long press action (triggered while button is held)
+    if (btn2_was_pressed && (millis() - btn2_press_time >= LONG_PRESS_DELAY)) {
+        if (!justWokeUp) {
+            setupWiFi(true);
+            btn2_was_pressed = false; // Prevent short press action on release
+        }
+    }
+
+    justWokeUp = false; // Reset wake flag after one loop cycle
 }
 
 
@@ -299,11 +276,10 @@ void forceSync() {
     displayMessage("Force Syncing...", "Please wait");
     if (WiFi.status() != WL_CONNECTED) {
         displayMessage("No WiFi", "Sync failed.", 2000);
-        showMainMenu();
-        return;
+    } else {
+        syncFingerprintsFromServer();
+        syncOfflineLogs();
     }
-    syncFingerprintsFromServer();
-    syncOfflineLogs();
     showMainMenu();
 }
 
@@ -340,11 +316,11 @@ void syncFingerprintsFromServer() {
     for(JsonObject user : users) {
       uint16_t id = user["id"];
       String b64_template = user["template"];
-
-      int decodedLen = base64_dec_len((char*)b64_template.c_str(), b64_template.length());
-      uint8_t decoded_template[decodedLen];
-      base64_decode((char*)decoded_template, (char*)b64_template.c_str(), b64_template.length());
       
+      uint16_t decodedLen = decode_base64_length((uint8_t*)b64_template.c_str(), b64_template.length());// Calculate required buffer size
+      uint8_t decoded_template[decodedLen];// Allocate buffer
+      decode_base64((uint8_t*)b64_template.c_str(), b64_template.length(), decoded_template);// Perform decoding
+
       if (uploadTemplate(decoded_template, decodedLen) == FINGERPRINT_OK) {
         if (finger.storeModel(id) != FINGERPRINT_OK) {
             displayMessage("Error storing ID", String(id), 1000);
@@ -364,7 +340,7 @@ void enrollNewFingerprint() {
     displayMessage("Enrollment:", "Fetching ID...", 10);
     uint16_t newId = fetchLastIdFromServer() + 1;
 
-    if (newId == 1) { // newId=0 from server + 1 = 1, indicating server/wifi error
+    if (newId == 1) {
         displayMessage("Enroll Failed", "Check Server/WiFi", 2000);
         showMainMenu(); return;
     }
@@ -399,12 +375,13 @@ void enrollNewFingerprint() {
         showMainMenu(); return;
     }
 
-    uint8_t templateBuffer[FINGERPRINT_TEMPLATE_SIZE];
-    memcpy(templateBuffer, finger.data, FINGERPRINT_TEMPLATE_SIZE); 
+    // This now works because we exposed 'templateBuffer' in the public section of the library's .h file
+// Calculate encoded length
+unsigned int encodedLen = encode_base64_length(FINGERPRINT_TEMPLATE_SIZE);
 
-    int encodedLen = base64_enc_len(FINGERPRINT_TEMPLATE_SIZE);
-    char b64_template[encodedLen + 1];
-    base64_encode(b64_template, (char*)templateBuffer, FINGERPRINT_TEMPLATE_SIZE);
+    char b64_template[encodedLen + 1];// Create buffer (+1 for null terminator)
+    encode_base64(finger.templateBuffer, FINGERPRINT_TEMPLATE_SIZE, (unsigned char*)b64_template);// Perform encoding
+    b64_template[encodedLen] = '\0';// Null terminate
 
     JsonDocument doc;
     doc["id"] = newId;
@@ -448,15 +425,12 @@ void scanForFingerprint() {
 
 bool logAttendanceToServer(uint16_t fingerID, uint8_t roomID, time_t timestamp) {
   if (WiFi.status() != WL_CONNECTED) return false;
-
   JsonDocument doc;
   doc["fingerid"] = fingerID;
   doc["roomid"] = roomID;
   doc["timestamp"] = timestamp;
-
   String payload;
   serializeJson(doc, payload);
-
   return postJsonToServer(ATTENDANCE_ENDPOINT, payload);
 }
 
@@ -487,7 +461,6 @@ void syncOfflineLogs() {
   }
   
   bool allSynced = true;
-
   while (logFile.available()) {
     String line = logFile.readStringUntil('\n');
     line.trim();
@@ -500,7 +473,6 @@ void syncOfflineLogs() {
       uint16_t id = line.substring(0, firstComma).toInt();
       uint8_t roomID_from_log = line.substring(firstComma + 1, secondComma).toInt();
       time_t timestamp = (time_t)strtoul(line.substring(secondComma + 1).c_str(), NULL, 10);
-
       if (!logAttendanceToServer(id, roomID_from_log, timestamp)) {
         allSynced = false;
         tempFile.println(line);
@@ -572,5 +544,5 @@ uint16_t fetchLastIdFromServer() {
     return id;
   }
   http.end();
-  return 0; // Return 0 on failure
+  return 0;
 }
